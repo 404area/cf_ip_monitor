@@ -1,0 +1,162 @@
+# ============================================================
+# CF IP Monitor 配置示例
+# 用法: cp config.example.yaml config.yaml 然后按需修改
+# Master 和 Agent 共用同一份配置，各自只读取自己需要的字段
+# ============================================================
+
+master:
+  host: "0.0.0.0"
+  port: 8088
+  # Agent 拉任务/回报需要带此 token, 任意长字符串即可
+  auth_token: "change-me-to-a-long-random-token"
+
+  database:
+    # 相对路径基于运行目录
+    path: "data/cfip.db"
+
+  scheduler:
+    # ----------------------------------------------------------
+    # 全量扫描周期 (小时)。
+    # 注意: CF v4 IP 池现在 ~5950 个 /24, 单 ISP 完整扫一轮 (排除测速)
+    # 在 concurrency=30 下大约 8-16 小时, 因此默认 24h, 避免轮次叠加。
+    # 想加速请同步把 agent.concurrency 调高 (60-120) 或部署更多 agent。
+    # ----------------------------------------------------------
+    full_scan_hours: 24
+    # /24 C段早停: 先采样这几个尾号, 全失败即跳过该段
+    c_segment_probe_offsets: [1, 65, 129, 193]
+    # 沉默段缓存时间(小时), 过期后会重新评估
+    c_segment_silent_ttl_hours: 6
+    # 单批次下发给 Agent 的任务条数
+    batch_size: 200
+    # housekeeping: 已 done 任务保留多久就被清理 (单位: 小时)
+    # 之前一直没清, 任务表会无限膨胀拖慢 SQLite, 默认 24h 留排错窗口
+    cleanup_done_after_hours: 24
+
+  # ============================================================
+  # 带宽测速 (独立开关)
+  #
+  # 为什么要独立?
+  #   - CF 对同 IP 频繁大流量请求会触发 429 / 限流
+  #   - 国内运营商对长时间大流量下载可能会做 QoS 甚至临时降速
+  #   - 部分场景 (只想看连通性/延迟/colo) 根本不需要带宽数据
+  #
+  # enabled=false 时:
+  #   - 调度器不再注册 speed_round, 不会下发任何 SPEED 任务
+  #   - 评分降级为 "无测速模式": 不再卡 min_speed_mbps 门槛
+  #     speed 权重转移到 latency + route_quality
+  #   - 文本/DNS 导出依旧工作, 但 BestPick.speed_mbps 字段会是 0
+  # ============================================================
+  speed_test:
+    enabled: true
+    # 调度周期(分钟): 多久跑一轮 speed_round
+    interval_minutes: 15
+    # 只对延迟最优的前 N% 候选测速 (节省带宽)
+    top_percentile: 0.2
+    # 单次下载字节数 (约 50MB, 控制单次耗时)
+    bytes: 50000000
+    # 单次下载超时(秒)
+    timeout_s: 15
+    # 速度门槛 MB/s, 低于此值不入选 (仅 enabled=true 时生效)
+    min_speed_mbps: 10
+
+  # ============================================================
+  # Traceroute + 路由分析 (v2 新增)
+  #
+  # 启用后, 调度器会:
+  #   - 每 interval_hours 对每个 ISP 的 best snapshot IP × top_n_per_isp 跑一次 traceroute
+  #   - 每跳通过 MaxMind ASN + qqwry / GeoLite2-City 富化 (ASN/国家/省/市)
+  #   - 自动派生路由标签: 163 / CN2-GT / CN2-GIA / 4837 / 9929 / 9808 / CMI / 普通 / 未知
+  #   - 自动识别国内出口城市 (广州/上海/北京/...)
+  #   - 评分时把 route_quality 作为第三个加权因子 (见 scoring.route_quality_enabled)
+  #
+  # 代价: 单次 traceroute 5-15s, 受系统 traceroute 命令存在性影响。
+  #       agent 端需要安装 traceroute (apt install traceroute / brew install traceroute)。
+  # ============================================================
+  traceroute:
+    enabled: true
+    # 多久对每个 IP 跑一次 (路径不会频繁变, 24h 足够)
+    interval_hours: 24
+    # 每个 ISP 最多跑多少个目标 (默认取 best snapshot 头部)
+    top_n_per_isp: 200
+    # 单次最大跳数
+    max_hops: 20
+    # 每跳超时(秒)
+    per_hop_timeout_s: 2.0
+
+  scoring:
+    # 延迟上限 ms, 高于此值不入选 (这是输出过滤, 原始数据仍全部入库, 见 README)
+    max_latency_ms: 300
+    # 每个 (ISP × 目标地区) 输出 top N 个 IP
+    top_n_per_bucket: 10
+    # 聚合窗口: 近多少天的数据用于评分
+    lookback_days: 7
+    # 优选时按当前小时±N小时的同时段历史数据加权
+    same_hour_window: 2
+    # ----- v2 新增 -----
+    # 抖动惩罚上限: jitter_ms >= 此值时 latency 评分被打 50% 折扣
+    max_jitter_ms: 200
+    # 是否启用路由质量评分 (CN2-GIA / 9929 等线路给高分)
+    # false 时退化为只看 latency+speed (兼容旧行为)
+    route_quality_enabled: true
+
+  exporters:
+    text_file:
+      enabled: true
+      # 不同运营商一份还是合并一份?  per_isp / merged
+      mode: "per_isp"
+      # 输出目录
+      output_dir: "output"
+      # 格式占位符: {ip} {isp_cn} {region_cn} {colo} {latency} {speed}
+      line_template: "{ip}#CF优选-{isp_cn}-{region_cn}"
+
+    huaweicloud_dns:
+      enabled: false
+      # 华为云访问凭证, 推荐通过环境变量注入
+      ak: "${HUAWEICLOUD_AK}"
+      sk: "${HUAWEICLOUD_SK}"
+      region: "ap-southeast-1"               # 华为云 DNS 区域, 一般取最近的
+      zone_id: "${HUAWEICLOUD_ZONE_ID}"      # 公网解析的 zone id, 强烈建议环境变量注入
+      record_name: "cf.example.com."         # 注意结尾的点
+      ttl: 60
+      # 智能解析线路 ID, 华为云内置线路: Dianxin / Liantong / Yidong
+      isp_line_map:
+        电信: "Dianxin"
+        联通: "Liantong"
+        移动: "Yidong"
+      # 每条线路最多写入多少个 IP
+      records_per_line: 20
+
+# ============================================================
+# Agent 端配置 (每台 VPS 部署时填一份, 也可统一一份用 --isp 参数覆盖)
+# ============================================================
+agent:
+  # Master 的可达地址 (一定要 Agent 能访问到)
+  master_url: "http://YOUR_MASTER_IP:8088"
+  auth_token: "change-me-to-a-long-random-token"
+
+  # 必填: 当前节点的运营商标签 (电信 / 联通 / 移动)
+  isp: "电信"
+  # 节点别名, 用于日志区分
+  node_name: "ct-hebei-01"
+
+  # 并发数, 根据 VPS 带宽和 CPU 调
+  concurrency: 30
+  # 拉任务空闲时的轮询间隔(秒)
+  idle_poll_interval: 5
+  # 单批最大任务条数
+  batch_max: 100
+
+  # ----- TCP_PING 默认参数 (master 未指定时使用) -----
+  # 单次 TCP 握手超时(秒)
+  tcp_timeout: 2
+  # 正式样本次数 (v2 改为 6, 之前 3)
+  tcp_retry: 6
+  # 预热次数, 结果不计入统计 (排除首次握手偏高)
+  tcp_warmup: 1
+
+  # ----- HTTP_TRACE 默认参数 -----
+  http_timeout: 5
+
+  # ----- TRACEROUTE 默认参数 -----
+  trace_max_hops: 20
+  trace_per_hop_timeout: 2.0

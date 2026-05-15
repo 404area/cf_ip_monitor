@@ -1,0 +1,23 @@
+[Unit]
+Description=CF IP Monitor Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cfip
+WorkingDirectory=/opt/cf_ip_monitor
+Environment=PYTHONUNBUFFERED=1
+# 依赖通过 `uv sync --frozen --no-dev` 装到 /opt/cf_ip_monitor/.venv
+# entrypoint 由 pyproject.toml 的 [project.scripts] 注册为 cf-ip-agent
+#
+# 不同节点的 --isp 与 --node-name 可在 config.yaml 里, 或在此追加 CLI 参数覆盖。
+# Agent 需要 traceroute 命令: apt install traceroute (Debian/Ubuntu)
+EnvironmentFile=-/etc/cf-ip-monitor.env
+ExecStart=/opt/cf_ip_monitor/.venv/bin/cf-ip-agent --config /opt/cf_ip_monitor/config.yaml
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

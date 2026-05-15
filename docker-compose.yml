@@ -1,0 +1,144 @@
+# CF IP Monitor — Docker Compose
+#
+# 快速开始:
+#   cp deploy/docker/.env.example .env
+#   cp config.example.yaml config.yaml   # 按需修改 auth_token 等
+#   # 下载 IP 库到 src/cf_ip_monitor/ipdata/ (见 README)
+#   docker compose build
+#   docker compose up -d master
+#   docker compose --profile agents up -d agent-ct
+#
+# 仅 Master:
+#   docker compose up -d master
+#
+# 多 Agent (电信 / 联通 / 移动):
+#   docker compose --profile agents up -d
+
+name: cf-ip-monitor
+
+services:
+  master:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: master
+    image: cf-ip-monitor/master:latest
+    container_name: cf-ip-master
+    restart: unless-stopped
+    ports:
+      - "${MASTER_PORT:-8088}:8088"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      HUAWEICLOUD_AK: ${HUAWEICLOUD_AK:-}
+      HUAWEICLOUD_SK: ${HUAWEICLOUD_SK:-}
+      HUAWEICLOUD_ZONE_ID: ${HUAWEICLOUD_ZONE_ID:-}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - master-data:/app/data
+      - master-output:/app/output
+      # IP 离线库 (GeoLite2 / dbip / ip2region / qqwry) 放宿主机同目录, 挂到镜像内 /app/ipdata
+      # 运行时通过环境变量 CF_IPDATA_DIR=/app/ipdata 指向该目录 (Dockerfile 已默认设置)
+      - ./src/cf_ip_monitor/ipdata:/app/ipdata:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/docs', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+
+  agent-ct:
+    profiles: [agents]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: agent
+    image: cf-ip-monitor/agent:latest
+    container_name: cf-ip-agent-ct
+    restart: unless-stopped
+    depends_on:
+      master:
+        condition: service_healthy
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    command:
+      - cf-ip-agent
+      - --config
+      - /app/config.yaml
+      - --master-url
+      - ${AGENT_MASTER_URL:-http://master:8088}
+      - --isp
+      - ${AGENT_CT_ISP:-电信}
+      - --node-name
+      - ${AGENT_CT_NODE_NAME:-ct-docker-01}
+    cap_add:
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+
+  agent-cu:
+    profiles: [agents]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: agent
+    image: cf-ip-monitor/agent:latest
+    container_name: cf-ip-agent-cu
+    restart: unless-stopped
+    depends_on:
+      master:
+        condition: service_healthy
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    command:
+      - cf-ip-agent
+      - --config
+      - /app/config.yaml
+      - --master-url
+      - ${AGENT_MASTER_URL:-http://master:8088}
+      - --isp
+      - ${AGENT_CU_ISP:-联通}
+      - --node-name
+      - ${AGENT_CU_NODE_NAME:-cu-docker-01}
+    cap_add:
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+
+  agent-cm:
+    profiles: [agents]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: agent
+    image: cf-ip-monitor/agent:latest
+    container_name: cf-ip-agent-cm
+    restart: unless-stopped
+    depends_on:
+      master:
+        condition: service_healthy
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    command:
+      - cf-ip-agent
+      - --config
+      - /app/config.yaml
+      - --master-url
+      - ${AGENT_MASTER_URL:-http://master:8088}
+      - --isp
+      - ${AGENT_CM_ISP:-移动}
+      - --node-name
+      - ${AGENT_CM_NODE_NAME:-cm-docker-01}
+    cap_add:
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  master-data:
+  master-output:

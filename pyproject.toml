@@ -1,0 +1,42 @@
+[project]
+name = "cf-ip-monitor"
+version = "0.2.0"
+description = "Distributed Cloudflare IP probing and selection"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.5",
+    "uvicorn[standard]==0.32.1",
+    "pydantic==2.9.2",
+    "PyYAML==6.0.2",
+    "APScheduler==3.10.4",
+    "httpx==0.27.2",
+    "sqlalchemy==2.0.36",
+    "huaweicloudsdkcore==3.1.106",
+    "huaweicloudsdkdns==3.1.106",
+    "geoip2==4.8.0",
+    "qqwry-py3==1.0.7",
+    "XdbSearchIP==1.0.2",
+]
+
+[project.scripts]
+cf-ip-master = "cf_ip_monitor.master.server:main"
+cf-ip-agent = "cf_ip_monitor.agent.runner:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cf_ip_monitor"]
+exclude = [
+    "src/cf_ip_monitor/ipdata/*.mmdb",
+    "src/cf_ip_monitor/ipdata/*.xdb",
+    "src/cf_ip_monitor/ipdata/*.dat",
+]
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = []

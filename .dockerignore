@@ -1,0 +1,35 @@
+.venv
+.idea
+.vscode
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+.DS_Store
+
+# 运行时数据 (用 named volume 注入)
+data/
+output/
+*.db
+*.db-journal
+
+# 配置 & 凭据 (compose 用 volume 挂载, 不打进镜像)
+config.yaml
+scripts/config.yaml
+.env
+.env.*
+!deploy/docker/.env.example
+
+# IP 离线库 (compose 用 volume 挂到 /app/ipdata, 不打进镜像)
+src/cf_ip_monitor/ipdata/*.mmdb
+src/cf_ip_monitor/ipdata/*.xdb
+src/cf_ip_monitor/ipdata/*.dat
+
+# 测试 / 缓存
+terminals/
+test/
+.pytest_cache
+.mypy_cache
+.ruff_cache
+uv.lock.bak

@@ -1,0 +1,35 @@
+# --- Python ---
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- 环境/配置 (含敏感信息, 严禁入库) ---
+.env
+.env.*
+!deploy/docker/.env.example
+config.yaml
+scripts/config.yaml
+
+# --- 运行时数据 ---
+data/
+output/
+*.db
+*.db-journal
+
+# --- IP 离线库 (体积大, 各自下载) ---
+src/cf_ip_monitor/ipdata/*.mmdb
+src/cf_ip_monitor/ipdata/*.xdb
+src/cf_ip_monitor/ipdata/*.dat
+
+# --- 工具/IDE ---
+.python-version
+.idea/
+.vscode/
+.DS_Store
+
+# --- uv 临时文件 ---
+uv.lock.bak

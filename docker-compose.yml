@@ -29,6 +29,7 @@ services:
       - "${MASTER_PORT:-8088}:8088"
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MASTER_AUTH_TOKEN: ${MASTER_AUTH_TOKEN:-}
       HUAWEICLOUD_AK: ${HUAWEICLOUD_AK:-}
       HUAWEICLOUD_SK: ${HUAWEICLOUD_SK:-}
       HUAWEICLOUD_ZONE_ID: ${HUAWEICLOUD_ZONE_ID:-}
@@ -60,18 +61,15 @@ services:
         condition: service_healthy
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # 同 compose 网络内: agent 通过服务名 "master" 访问 master 容器的 8088
+      AGENT_MASTER_URL: ${AGENT_MASTER_URL:-http://master:8088}
+      # AGENT_AUTH_TOKEN 留空时, runner 会自动 fallback 到 MASTER_AUTH_TOKEN (同机 compose 场景常用)
+      AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:-}
+      MASTER_AUTH_TOKEN: ${MASTER_AUTH_TOKEN:-}
+      AGENT_ISP: ${AGENT_CT_ISP:-电信}
+      AGENT_NODE_NAME: ${AGENT_CT_NODE_NAME:-ct-docker-01}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-    command:
-      - cf-ip-agent
-      - --config
-      - /app/config.yaml
-      - --master-url
-      - ${AGENT_MASTER_URL:-http://master:8088}
-      - --isp
-      - ${AGENT_CT_ISP:-电信}
-      - --node-name
-      - ${AGENT_CT_NODE_NAME:-ct-docker-01}
     cap_add:
       - NET_RAW
     security_opt:
@@ -91,18 +89,13 @@ services:
         condition: service_healthy
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AGENT_MASTER_URL: ${AGENT_MASTER_URL:-http://master:8088}
+      AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:-}
+      MASTER_AUTH_TOKEN: ${MASTER_AUTH_TOKEN:-}
+      AGENT_ISP: ${AGENT_CU_ISP:-联通}
+      AGENT_NODE_NAME: ${AGENT_CU_NODE_NAME:-cu-docker-01}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-    command:
-      - cf-ip-agent
-      - --config
-      - /app/config.yaml
-      - --master-url
-      - ${AGENT_MASTER_URL:-http://master:8088}
-      - --isp
-      - ${AGENT_CU_ISP:-联通}
-      - --node-name
-      - ${AGENT_CU_NODE_NAME:-cu-docker-01}
     cap_add:
       - NET_RAW
     security_opt:
@@ -122,23 +115,45 @@ services:
         condition: service_healthy
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AGENT_MASTER_URL: ${AGENT_MASTER_URL:-http://master:8088}
+      AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:-}
+      MASTER_AUTH_TOKEN: ${MASTER_AUTH_TOKEN:-}
+      AGENT_ISP: ${AGENT_CM_ISP:-移动}
+      AGENT_NODE_NAME: ${AGENT_CM_NODE_NAME:-cm-docker-01}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-    command:
-      - cf-ip-agent
-      - --config
-      - /app/config.yaml
-      - --master-url
-      - ${AGENT_MASTER_URL:-http://master:8088}
-      - --isp
-      - ${AGENT_CM_ISP:-移动}
-      - --node-name
-      - ${AGENT_CM_NODE_NAME:-cm-docker-01}
     cap_add:
       - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+
+  # ----------------------------------------------------------
+  # nginx 反代 (公网 HTTPS 入口, profile=edge)
+  # 用法:
+  #   1) cp deploy/nginx/master.conf.example deploy/nginx/master.conf  (改 server_name)
+  #   2) 放证书到 deploy/nginx/certs/{fullchain,privkey}.pem
+  #      或 ./scripts/gen-self-signed-cert.sh master.example.com 自签
+  #   3) docker compose --profile edge up -d nginx
+  # ----------------------------------------------------------
+  nginx:
+    profiles: [edge]
+    image: nginx:1.27-alpine
+    container_name: cf-ip-nginx
+    restart: unless-stopped
+    depends_on:
+      master:
+        condition: service_healthy
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./deploy/nginx/master.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/nginx/certs:/etc/nginx/certs:ro
+      - nginx-logs:/var/log/nginx
     security_opt:
       - no-new-privileges:true
 
 volumes:
   master-data:
   master-output:
+  nginx-logs:

@@ -241,30 +241,74 @@ curl -H "Authorization: Bearer $TOKEN" http://master:8088/v1/round/list?limit=10
 - **首选: Docker + uv 自动化部署** (Dockerfile 内部用 uv 装依赖, compose 一键起)
 - **备选: 裸金属 systemd + uv** (无 Docker 环境时)
 
-### 0. 一次性准备
+### 0. 三种网络场景概览
+
+`config.yaml` 里 `agent.master_url` / `agent.auth_token` / `agent.isp` / `agent.node_name` 与 `master.auth_token` 都默认是 `${VAR}` 占位符, 真值通过环境变量注入。优先级: **CLI > `${VAR}` 展开 > 环境变量 > config 字面值 > 内置默认**。
+
+```
+场景 A: 同机 Docker compose (master + agent 在一台机器上, 一个 compose project)
+┌──────────────── 一台机 (cf-ip-monitor compose) ────────────────┐
+│  ┌─────────────┐                  ┌──────────────────────┐   │
+│  │   master    │ ← service name → │  agent-ct / cu / cm  │   │
+│  │ :8088 (in)  │   "master:8088"  │                      │   │
+│  └─────────────┘                  └──────────────────────┘   │
+│       │                                                       │
+│       └── 宿主机 ${MASTER_PORT:-8088} (可选直接暴露)            │
+└───────────────────────────────────────────────────────────────┘
+默认 AGENT_MASTER_URL=http://master:8088
+
+场景 B: 本机 master + 公网 / 内网 IP 直连 (无 nginx 域名)
+┌─ master 主机 ─┐                ┌─ agent VPS ─┐
+│  master :8088 │ ←─── HTTP ───  │   agent      │
+│  暴露 0.0.0.0 │   (公网/内网)  │              │
+└───────────────┘                └──────────────┘
+agent 端: AGENT_MASTER_URL=http://<MASTER_IP>:8088
+
+场景 C: 公网 master + nginx 域名 + TLS (推荐生产)
+┌────── master 主机 ──────┐                ┌─ agent VPS ─┐
+│  ┌───────┐   ┌────────┐ │                │              │
+│  │ nginx │ ← │ master │ │ ← HTTPS 域名 ─ │   agent      │
+│  │ :443  │   │ :8088  │ │  (Let's Enc)   │              │
+│  └───────┘   └────────┘ │                │              │
+│  ↑ 暴露 80/443          │                │              │
+└─────────────────────────┘                └──────────────┘
+agent 端: AGENT_MASTER_URL=https://master.example.com
+```
+
+### 1. 一次性准备
 
 ```bash
-# 安装 uv (本机或服务器, root 用户)
+# 安装 uv (本机或服务器)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 克隆代码
 git clone <repo> cf_ip_monitor
 cd cf_ip_monitor
 
-# 准备配置
+# 准备配置 (默认全是 ${VAR} 占位符, 真值都在 .env)
 cp config.example.yaml config.yaml
-$EDITOR config.yaml   # 至少改 master.auth_token 和 agent.auth_token
-
-# 准备 .env (注入华为云凭据 / 端口等敏感或环境相关变量)
 cp deploy/docker/.env.example .env
-$EDITOR .env
+$EDITOR .env                          # 至少改 MASTER_AUTH_TOKEN
 
 # 下载 4 个 IP 离线库到 src/cf_ip_monitor/ipdata/ (见上文「IP 数据库」)
 # (Docker 会把这个目录挂载到容器内 /app/ipdata, 不打进镜像)
 ```
 
+`.env` 至少要填的:
+
+```bash
+MASTER_AUTH_TOKEN=<长随机字符串>      # 必填, master 与 agent 用同一个
+
+# 场景 A (同机) 通常这一项就够了, agent_token 留空会自动用 master_token
+AGENT_MASTER_URL=http://master:8088   # 默认值, 不必改
+
+# 场景 B / C 时
+# AGENT_MASTER_URL=https://master.example.com 或 http://<MASTER_IP>:8088
+# AGENT_AUTH_TOKEN=<与 MASTER_AUTH_TOKEN 同值>
+```
+
 > **安全约束**: `config.yaml` 与 `.env` 已写入 `.gitignore`/`.dockerignore`, 切勿入库。
-> `config.yaml` 中所有敏感字段 (`ak`, `sk`, `zone_id`, `record_name`, `region`) 都支持 `${VAR}` 占位符, 实际值通过 `.env` → compose → 容器环境变量注入。
+> `config.yaml` 中所有敏感字段都支持 `${VAR}` 占位符, 实际值通过 `.env` → compose → 容器环境变量注入。
 
 ### 1. Docker + uv (推荐)
 
@@ -275,11 +319,37 @@ $EDITOR .env
 ```bash
 chmod +x scripts/docker-deploy.sh
 
-./scripts/docker-deploy.sh master   # 仅 Master
-./scripts/docker-deploy.sh all      # Master + 三网 Agent (compose profile=agents)
+# 同机部署 (master 与 agent 在同一台机器)
+./scripts/docker-deploy.sh master              # 仅 Master
+./scripts/docker-deploy.sh master+ct           # Master + 电信 Agent
+./scripts/docker-deploy.sh master+cu           # Master + 联通 Agent
+./scripts/docker-deploy.sh master+cm           # Master + 移动 Agent
+./scripts/docker-deploy.sh all                 # Master + 三网 Agent
+
+# 跨机部署: 单独跑一个 Agent (Master 在别处)
+AGENT_MASTER_URL=https://master.example.com:8088 \
+AGENT_ISP=电信 \
+AGENT_NODE_NAME=ct-hk-01 \
+    ./scripts/docker-deploy.sh agent
+
+# 在已运行的 Master 旁边追加一个本机 Agent
+./scripts/docker-deploy.sh agent-ct            # 只起 docker-compose.yml 的 agent-ct
+./scripts/docker-deploy.sh agent-cu
+./scripts/docker-deploy.sh agent-cm
+
+# 运维
+./scripts/docker-deploy.sh status              # 看所有服务状态
+./scripts/docker-deploy.sh logs                # 跟随全部日志
+./scripts/docker-deploy.sh logs master         # 只看 master
+./scripts/docker-deploy.sh down                # 全停
+./scripts/docker-deploy.sh --help              # 完整说明
 ```
 
 脚本会自动: 缺 `config.yaml` 从示例复制 → 缺 `.env` 从示例复制 → 缺 `uv.lock` 调 `uv lock` → `docker compose build` → `up -d`。
+
+> 区别提醒:
+> - `agent-ct/cu/cm` 走 `docker-compose.yml` (与 master 共用 compose project, 通过服务名 `master` 互联);
+> - `agent` 走 `docker-compose.agent.yml` (独立 compose project, 通过 `AGENT_MASTER_URL` 显式指定远端 master)。
 
 #### 1.2 Makefile
 
@@ -312,25 +382,66 @@ docker compose --profile agents up -d    # 同机三网 Agent
 | `/app/data` | named volume `master-data` | SQLite 持久化 |
 | `/app/output` | named volume `master-output` | 优选文本输出 |
 
-#### 1.4 远程 VPS 只跑 Agent
+#### 1.4 公网 master + nginx 反代 (场景 C)
 
-Master 在别处, VPS 单独跑 Agent:
+```bash
+# 0) 解析域名到 master 主机
+#    A 记录: master.example.com -> <你的服务器 IP>
+
+# 1) 准备 nginx 配置
+cp deploy/nginx/master.conf.example deploy/nginx/master.conf
+sed -i 's/master.example.com/<你的域名>/g' deploy/nginx/master.conf
+
+# 2) 申请证书 (二选一)
+# 2a) Let's Encrypt (推荐, 生产)
+sudo apt install -y certbot
+sudo certbot certonly --standalone -d <你的域名>
+sudo cp /etc/letsencrypt/live/<你的域名>/fullchain.pem deploy/nginx/certs/
+sudo cp /etc/letsencrypt/live/<你的域名>/privkey.pem   deploy/nginx/certs/
+
+# 2b) 或者自签 (仅测试)
+./scripts/gen-self-signed-cert.sh <你的域名>
+
+# 3) 起 master + nginx
+./scripts/docker-deploy.sh master-edge
+# 或 master + 一个本机 agent + nginx 一次起完
+./scripts/docker-deploy.sh master-edge+ct
+
+# 4) 验证
+curl https://<你的域名>/healthz
+```
+
+#### 1.5 远程 VPS 只跑 Agent (场景 B / C)
+
+VPS 上单独跑 Agent, 连远程 master:
 
 ```bash
 # 在 VPS 上
 git clone <repo> cf_ip_monitor && cd cf_ip_monitor
-cp config.example.yaml config.yaml    # 改 agent.auth_token
 
-export AGENT_MASTER_URL=https://your-master.example.com:8088
-export AGENT_ISP=电信
-export AGENT_NODE_NAME=ct-hk-01
+# 把场景 B 或 C 的连接参数填进 .env (或临时 export)
+cp deploy/docker/.env.example .env
+$EDITOR .env
+# 至少需要:
+#   AGENT_MASTER_URL=https://master.example.com   # 或 http://<MASTER_IP>:8088
+#   AGENT_AUTH_TOKEN=<与 master 一致>
+#   AGENT_ISP=电信
+#   AGENT_NODE_NAME=ct-hk-01
 
-docker compose -f docker-compose.agent.yml up -d --build
+# IP 库可以不下 (agent 不做 enrich), 直接起:
+./scripts/docker-deploy.sh agent
+
+# 或临时 export 不写 .env:
+AGENT_MASTER_URL=https://master.example.com \
+AGENT_AUTH_TOKEN=xxxx \
+AGENT_ISP=电信 AGENT_NODE_NAME=ct-hk-01 \
+    ./scripts/docker-deploy.sh agent
 ```
 
 > Agent 跑 traceroute 需要 raw socket, compose 已加 `cap_add: NET_RAW`, 宿主机一般无需额外配置。
+> Agent 连 https 域名时, 默认会校验 TLS 证书; 自签证书测试请用 Let's Encrypt, 或者用 http (不加密)。
 
-#### 1.5 升级 / 回滚 / 备份
+#### 1.6 升级 / 回滚 / 备份
 
 ```bash
 # 升级 (代码或依赖)

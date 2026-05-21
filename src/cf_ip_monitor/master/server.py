@@ -107,7 +107,13 @@ def _resolve_trace_cfg(mcfg: dict) -> dict:
 def build_app(config_path: str) -> FastAPI:
     cfg = load_config(config_path)
     mcfg = cfg["master"]
-    auth_token = mcfg["auth_token"]
+    # auth_token 支持 ${VAR} 占位符 + 环境变量降级
+    raw_token = mcfg.get("auth_token", "")
+    if isinstance(raw_token, str) and raw_token.startswith("${") and raw_token.endswith("}"):
+        raw_token = os.environ.get(raw_token[2:-1], "")
+    auth_token = raw_token or os.environ.get("MASTER_AUTH_TOKEN", "")
+    if not auth_token:
+        logger.warning("master.auth_token 为空, /v1/* 接口将拒绝所有请求; 请配置 config.yaml 或注入 MASTER_AUTH_TOKEN")
 
     storage = Storage(mcfg["database"]["path"])
     isps = list(mcfg.get("agent_isps") or ["电信", "联通", "移动"])

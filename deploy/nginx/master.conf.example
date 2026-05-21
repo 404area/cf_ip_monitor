@@ -1,0 +1,68 @@
+# CF IP Monitor — Master HTTPS 反代示例
+#
+# 用法 (docker compose, 配合 --profile edge):
+#   1) cp deploy/nginx/master.conf.example deploy/nginx/master.conf
+#   2) 替换下面的 server_name 为你的域名
+#   3) 把证书放到 deploy/nginx/certs/fullchain.pem + privkey.pem
+#      (Let's Encrypt 用 certbot 取证, 或者 ./scripts/gen-self-signed-cert.sh 自签)
+#   4) docker compose --profile edge up -d nginx
+#
+# 用法 (宿主机直接装的 nginx):
+#   把本文件 (改完域名/证书路径) 放到 /etc/nginx/conf.d/cf-ip-master.conf, 然后 nginx -t && nginx -s reload。
+#   注意把 proxy_pass 改为 http://127.0.0.1:${MASTER_PORT:-8088} (因为 docker 网络名 master 在宿主机看不到)。
+
+# ----- HTTP: 强制跳 HTTPS -----
+server {
+    listen      80;
+    listen      [::]:80;
+    server_name master.example.com;
+
+    location /.well-known/acme-challenge/ {
+        # 给 certbot --webroot 留口子, 不强制跳 https
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ----- HTTPS: 反代到 master 容器的 8088 -----
+server {
+    listen      443 ssl;
+    listen      [::]:443 ssl;
+    http2       on;
+    server_name master.example.com;
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # FastAPI 的 /docs 与回报体不会特别大, 50m 留余量
+    client_max_body_size 50m;
+
+    # 默认全部反代到 master 容器
+    location / {
+        # docker compose 内部网络名解析: master:8088
+        # 如果是宿主机直装 nginx, 改成 http://127.0.0.1:${MASTER_PORT:-8088}
+        proxy_pass         http://master:8088;
+        proxy_http_version 1.1;
+
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        # Bearer Token 透传
+        proxy_set_header   Authorization     $http_authorization;
+
+        proxy_connect_timeout 10s;
+        proxy_send_timeout    120s;
+        proxy_read_timeout    120s;
+    }
+
+    # 简单访问控制示例: 把 /docs 限制在内网或加 basic auth
+    # location = /docs { allow 10.0.0.0/8; deny all; }
+}

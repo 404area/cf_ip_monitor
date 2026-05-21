@@ -9,7 +9,8 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 
-COPY pyproject.toml uv.lock ./
+# README.md 是 pyproject.toml 声明的 readme 字段, hatchling 构建 wheel 时会校验存在
+COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 
 RUN --mount=type=cache,target=/root/.cache/uv \

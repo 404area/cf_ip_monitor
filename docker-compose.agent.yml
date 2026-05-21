@@ -1,10 +1,13 @@
-# 在远程 VPS 上单独跑 Agent (Master 已在别处部署)
+# 远程 VPS 上单独跑 Agent (Master 已在别处部署)
 #
 # 用法:
-#   export AGENT_MASTER_URL=https://your-master:8088
+#   export AGENT_MASTER_URL=https://your-master.example.com:8088   # 或 http://1.2.3.4:8088
+#   export AGENT_AUTH_TOKEN=<与 master 一致的长随机字符串>
 #   export AGENT_ISP=电信
-#   export AGENT_NODE_NAME=ct-vps-01
-#   docker compose -f docker-compose.agent.yml up -d
+#   export AGENT_NODE_NAME=ct-vps-hk-01
+#   docker compose -f docker-compose.agent.yml up -d --build
+#
+# 或者把变量写进同目录的 .env, 然后直接 up。
 
 name: cf-ip-monitor-agent
 
@@ -17,18 +20,14 @@ services:
     image: cf-ip-monitor/agent:latest
     container_name: cf-ip-agent
     restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AGENT_MASTER_URL: "${AGENT_MASTER_URL:?set AGENT_MASTER_URL, e.g. https://master.example.com}"
+      AGENT_AUTH_TOKEN: "${AGENT_AUTH_TOKEN:?set AGENT_AUTH_TOKEN, must match master}"
+      AGENT_ISP: "${AGENT_ISP:?set AGENT_ISP, one of 电信/联通/移动}"
+      AGENT_NODE_NAME: "${AGENT_NODE_NAME:?set AGENT_NODE_NAME, e.g. ct-hk-01}"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-    command:
-      - cf-ip-agent
-      - --config
-      - /app/config.yaml
-      - --master-url
-      - ${AGENT_MASTER_URL:?set AGENT_MASTER_URL}
-      - --isp
-      - ${AGENT_ISP:?set AGENT_ISP}
-      - --node-name
-      - ${AGENT_NODE_NAME:?set AGENT_NODE_NAME}
     cap_add:
       - NET_RAW
     security_opt:

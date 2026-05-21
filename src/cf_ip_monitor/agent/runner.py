@@ -42,6 +42,17 @@ from cf_ip_monitor.agent.probes.traceroute import traceroute  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def _resolve_env(value):
+    """支持 ${ENV_NAME} 占位符。空值或非字符串原样返回。
+
+    config.yaml 里如 master_url: "${AGENT_MASTER_URL}" 会被展开为对应环境变量。
+    若环境变量未设置, 返回空串, 调用方再走默认值 fallback。
+    """
+    if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+        return os.environ.get(value[2:-1], "")
+    return value
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -123,10 +134,35 @@ def execute_task(task: ProbeTask) -> ProbeResult:
 class AgentRunner:
     def __init__(self, cfg: dict) -> None:
         a = cfg["agent"]
-        self.master_url = a["master_url"].rstrip("/")
-        self.token = a["auth_token"]
-        self.isp = a["isp"]
-        self.node_name = a["node_name"]
+        # 优先级: CLI (在 main() 里塞回 cfg) > ${VAR} 展开 > 环境变量 > config 字面值 > 内置默认
+        self.master_url = (
+            _resolve_env(a.get("master_url"))
+            or os.environ.get("AGENT_MASTER_URL")
+            or "http://127.0.0.1:8088"
+        ).rstrip("/")
+        # token 降级链: config(${AGENT_AUTH_TOKEN}) > env AGENT_AUTH_TOKEN > env MASTER_AUTH_TOKEN
+        # 同机 compose 场景下, 只需配 MASTER_AUTH_TOKEN, agent 也能用同一个 token 跑起来
+        self.token = (
+            _resolve_env(a.get("auth_token"))
+            or os.environ.get("AGENT_AUTH_TOKEN")
+            or os.environ.get("MASTER_AUTH_TOKEN")
+            or ""
+        )
+        self.isp = (
+            _resolve_env(a.get("isp"))
+            or os.environ.get("AGENT_ISP")
+            or ""
+        )
+        self.node_name = (
+            _resolve_env(a.get("node_name"))
+            or os.environ.get("AGENT_NODE_NAME")
+            or ""
+        )
+        if not self.token:
+            logger.warning("agent.auth_token 为空, 请通过 config.yaml 或 AGENT_AUTH_TOKEN 注入")
+        if not self.isp or not self.node_name:
+            raise SystemExit("agent.isp / agent.node_name 必须提供 (config.yaml / 环境变量 / CLI)")
+        logger.info("agent target master_url=%s isp=%s node=%s", self.master_url, self.isp, self.node_name)
         self.concurrency = int(a.get("concurrency", 30))
         self.idle_poll = float(a.get("idle_poll_interval", 5))
         self.batch_max = int(a.get("batch_max", 100))

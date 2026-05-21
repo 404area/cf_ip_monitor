@@ -8,7 +8,8 @@ master:
   host: "0.0.0.0"
   port: 8088
   # Agent 拉任务/回报需要带此 token, 任意长字符串即可
-  auth_token: "change-me-to-a-long-random-token"
+  # 推荐用 ${MASTER_AUTH_TOKEN} 占位符 + 环境变量注入, 不要把真值写进版本控制
+  auth_token: "${MASTER_AUTH_TOKEN}"
 
   database:
     # 相对路径基于运行目录
@@ -128,16 +129,25 @@ master:
 
 # ============================================================
 # Agent 端配置 (每台 VPS 部署时填一份, 也可统一一份用 --isp 参数覆盖)
+#
+# 所有字段都支持 ${VAR} 占位符 + 环境变量降级, 优先级:
+#   CLI --master-url/--isp/... > ${VAR} 展开 > 同名环境变量 > 此 yaml 字面值 > 内置默认
+#
+# Docker 同机 (master+agent 在同一 compose):  AGENT_MASTER_URL=http://master:8088
+# Docker 跨机 / 裸金属本机:                    AGENT_MASTER_URL=http://127.0.0.1:8088
+# 公网 master (nginx 域名):                    AGENT_MASTER_URL=https://master.example.com
 # ============================================================
 agent:
   # Master 的可达地址 (一定要 Agent 能访问到)
-  master_url: "http://YOUR_MASTER_IP:8088"
-  auth_token: "change-me-to-a-long-random-token"
+  # 不写或留空时, runner 会自动 fallback 到 $AGENT_MASTER_URL, 再 fallback 到 http://127.0.0.1:8088
+  master_url: "${AGENT_MASTER_URL}"
+  # 与 master.auth_token 必须一致
+  auth_token: "${AGENT_AUTH_TOKEN}"
 
   # 必填: 当前节点的运营商标签 (电信 / 联通 / 移动)
-  isp: "电信"
+  isp: "${AGENT_ISP}"
   # 节点别名, 用于日志区分
-  node_name: "ct-hebei-01"
+  node_name: "${AGENT_NODE_NAME}"
 
   # 并发数, 根据 VPS 带宽和 CPU 调
   concurrency: 30

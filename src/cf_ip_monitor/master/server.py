@@ -121,7 +121,16 @@ def build_app(config_path: str) -> FastAPI:
 
     # 预初始化 enricher (确保 mmdb / qqwry 文件存在)
     enricher = Enricher.get()
-    logger.info("ipdata: %s", _ipdata_avail())
+    ipdata_status = _ipdata_avail()
+    logger.info("ipdata: %s", ipdata_status)
+    _required_ipdata = ("asn",)
+    missing_required = [k for k in _required_ipdata if not ipdata_status.get(k, {}).get("exists")]
+    if missing_required:
+        logger.warning(
+            "IP 离线库缺失 (%s): 地区/ASN/路由富化将不可用。"
+            "请运行 scripts/download_ipdata.sh 并按提示补全 MaxMind GeoLite2-ASN.mmdb",
+            ", ".join(missing_required),
+        )
 
     st_cfg = _resolve_speed_test_cfg(mcfg)
     tr_cfg = _resolve_trace_cfg(mcfg)
@@ -225,26 +234,30 @@ def build_app(config_path: str) -> FastAPI:
         max_n = max(1, min(body.max, mcfg["scheduler"]["batch_size"]))
         rows = storage.claim_pending(body.isp, max_n)
         tasks: List[ProbeTask] = []
+        bad_ids: List[str] = []
         for r in rows:
             try:
                 p = json.loads(r["payload_json"])
-            except Exception:
-                continue
-            kind = ProbeKind(p.get("kind", r["kind"]))
-            tasks.append(ProbeTask(
-                task_id=r["task_id"],
-                ip=p["ip"],
-                kind=kind,
-                port=p.get("port", 443),
-                timeout_s=p.get("timeout_s", 2.0),
-                retry=p.get("retry", 6),
-                warmup=p.get("warmup", 1),
-                speed_bytes=p.get("speed_bytes"),
-                speed_timeout_s=p.get("speed_timeout_s"),
-                http_host=p.get("http_host", "speed.cloudflare.com"),
-                max_hops=p.get("max_hops", tr_cfg["max_hops"]),
-                per_hop_timeout_s=p.get("per_hop_timeout_s", tr_cfg["per_hop_timeout_s"]),
-            ))
+                kind = ProbeKind(p.get("kind", r["kind"]))
+                tasks.append(ProbeTask(
+                    task_id=r["task_id"],
+                    ip=p["ip"],
+                    kind=kind,
+                    port=p.get("port", 443),
+                    timeout_s=p.get("timeout_s", 2.0),
+                    retry=p.get("retry", 6),
+                    warmup=p.get("warmup", 1),
+                    speed_bytes=p.get("speed_bytes"),
+                    speed_timeout_s=p.get("speed_timeout_s"),
+                    http_host=p.get("http_host", "speed.cloudflare.com"),
+                    max_hops=p.get("max_hops", tr_cfg["max_hops"]),
+                    per_hop_timeout_s=p.get("per_hop_timeout_s", tr_cfg["per_hop_timeout_s"]),
+                ))
+            except Exception as e:
+                logger.warning("pull: skip bad task %s: %s", r["task_id"], e)
+                bad_ids.append(r["task_id"])
+        if bad_ids:
+            storage.release_assigned_tasks(bad_ids)
         return BatchAssignment(
             batch_id=uuid.uuid4().hex,
             assigned_at_ms=int(_t.time() * 1000),
@@ -282,49 +295,48 @@ def build_app(config_path: str) -> FastAPI:
         sample_results_by_cidr: Dict[str, List[bool]],
         scan_round_id: Optional[str],
     ) -> None:
-        """sample 阶段每收一批就尝试更新 c_segment_state: alive / silent。
+        """sample 阶段每收一批就更新 c_segment_state。
 
-        我们没办法 "原子地知道一个 cidr 的所有 sample task 都回来了",
-        因此采用 "宽容策略": 只要任意一次回报里出现了 ok=True, 就立刻标 alive;
-        全部失败的 cidr 等到该 cidr 所有 sample 任务都 done 后再标 silent。
+        关键: 判定 silent 时必须汇总该 /24 本轮**全部**采样结果,
+        不能只看当前回报批次 —— 否则会出现「.1 已成功、后续批次全失败
+        却被标为 silent」的误判。
         """
-        if not sample_results_by_cidr:
+        if not sample_results_by_cidr or not scan_round_id:
             return
         ttl_s = mcfg["scheduler"]["c_segment_silent_ttl_hours"] * 3600
 
-        # 先把出现了 ok 的 cidr 直接 alive
-        for cidr, oks in sample_results_by_cidr.items():
-            if any(oks):
+        for cidr in sample_results_by_cidr:
+            done_n, task_total = storage.sample_task_progress(isp, cidr, scan_round_id)
+            if task_total == 0:
+                continue
+
+            ok_n, probe_total = storage.sample_cidr_probe_summary(
+                isp, cidr, scan_round_id,
+            )
+
+            if done_n < task_total:
+                # 采样尚未全部完成: 乐观标 alive, 但不标 silent
+                if ok_n > 0:
+                    storage.set_segment_state(
+                        isp, cidr, "alive", ttl_s,
+                        sample_ok=ok_n, sample_total=probe_total or task_total,
+                        sampled_round=scan_round_id,
+                    )
+                continue
+
+            # 全部采样任务已回报: 以 DB 汇总为准做最终判定
+            if ok_n > 0:
                 storage.set_segment_state(
                     isp, cidr, "alive", ttl_s,
-                    sample_ok=sum(1 for x in oks if x),
-                    sample_total=len(oks),
+                    sample_ok=ok_n, sample_total=probe_total or task_total,
                     sampled_round=scan_round_id,
                 )
-
-        # 对没有 ok 的 cidr, 检查这一轮该 cidr 的 sample 任务是否全部 done
-        if scan_round_id:
-            with storage._conn() as c:
-                for cidr, oks in sample_results_by_cidr.items():
-                    if any(oks):
-                        continue
-                    row = c.execute(
-                        """SELECT
-                              SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) AS done_n,
-                              COUNT(*) AS total
-                           FROM task_queue
-                           WHERE isp=? AND stage='sample' AND scan_round_id=?
-                             AND payload_json LIKE ?""",
-                        (isp, scan_round_id, f'%"cidr": "{cidr}"%'),
-                    ).fetchone()
-                    if not row or not row["total"]:
-                        continue
-                    if row["done_n"] == row["total"]:
-                        storage.set_segment_state(
-                            isp, cidr, "silent", ttl_s,
-                            sample_ok=0, sample_total=row["total"],
-                            sampled_round=scan_round_id,
-                        )
+            else:
+                storage.set_segment_state(
+                    isp, cidr, "silent", ttl_s,
+                    sample_ok=0, sample_total=probe_total or task_total,
+                    sampled_round=scan_round_id,
+                )
 
     @app.post("/v1/tasks/report")
     def report(body: ResultBatch, _=Depends(_check_token)):
@@ -444,11 +456,15 @@ def build_app(config_path: str) -> FastAPI:
         """Web UI 概览数据: 当前轮次、任务队列、ISP 列表。"""
         rid = storage.current_round()
         prog = storage.round_progress(rid) if rid else None
+        ipdata = _ipdata_avail()
+        ipdata_missing = [k for k, v in ipdata.items() if not v.get("exists")]
         return {
             "current_round": rid,
             "round_progress": prog.__dict__ if prog else None,
             "pending_by_isp": storage.pending_count_by_isp(),
             "isps": isps,
+            "ipdata": ipdata,
+            "ipdata_missing": ipdata_missing,
         }
 
     @app.get("/api/ui/best_ips")
@@ -468,20 +484,22 @@ def build_app(config_path: str) -> FastAPI:
 
     @app.get("/api/ui/probe_recent")
     def ui_probe_recent(
-        limit: int = 200,
+        limit: int = 500,
+        offset: int = 0,
         isp: Optional[str] = None,
         kind: Optional[str] = None,
         ip: Optional[str] = None,
         _=Depends(_check_token),
     ):
-        """Web UI 探测明细: 最近 N 条探测记录。"""
-        rows = storage.recent_probe_raw(
-            limit=min(limit, 500),
+        """Web UI 探测明细: 最近 N 条探测记录 (支持分页)。"""
+        rows, total = storage.recent_probe_raw(
+            limit=min(max(limit, 1), 2000),
+            offset=max(offset, 0),
             isp=isp or None,
             kind=kind or None,
             ip_filter=ip or None,
         )
-        return {"probes": rows}
+        return {"probes": rows, "total": total, "offset": offset, "limit": limit}
 
     @app.get("/api/ui/probe_stats")
     def ui_probe_stats(hours: int = 24, _=Depends(_check_token)):

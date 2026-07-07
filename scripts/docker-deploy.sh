@@ -82,6 +82,15 @@ ensure_files() {
     command -v uv >/dev/null || { echo "请先安装 uv: https://docs.astral.sh/uv/"; exit 1; }
     uv lock
   fi
+
+  if [[ ! -f src/cf_ip_monitor/ipdata/GeoLite2-ASN.mmdb ]]; then
+    echo "IP 离线库缺失, 自动下载 (GitHub 镜像, 无需 MaxMind 注册)..."
+    chmod +x scripts/download_ipdata.sh
+    ./scripts/download_ipdata.sh || {
+      echo "IP 库下载失败, 请检查网络后重试: ./scripts/download_ipdata.sh"
+      exit 1
+    }
+  fi
 }
 
 ensure_remote_agent_env() {

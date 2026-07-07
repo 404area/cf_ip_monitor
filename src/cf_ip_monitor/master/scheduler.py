@@ -74,17 +74,20 @@ class MasterScheduler:
             self._safe(self.run_sample_round),
             "interval", hours=self.full_scan_hours,
             id="sample_round", next_run_time=_now_plus(5),
+            max_instances=1, coalesce=True,
         )
         self._sched.add_job(
             self._safe(self.run_process_results),
             "interval", minutes=2,
             id="process_results", next_run_time=_now_plus(30),
+            max_instances=1, coalesce=True,
         )
         if self.speed_enabled:
             self._sched.add_job(
                 self._safe(self.run_speed_round),
                 "interval", minutes=self.speed_interval_minutes,
                 id="speed_round", next_run_time=_now_plus(180),
+                max_instances=1, coalesce=True,
             )
         else:
             logger.info("speed_test disabled: skipping speed_round registration")
@@ -93,11 +96,13 @@ class MasterScheduler:
                 self._safe(self.run_trace_round),
                 "interval", hours=self.trace_interval_hours,
                 id="trace_round", next_run_time=_now_plus(600),
+                max_instances=1, coalesce=True,
             )
             self._sched.add_job(
                 self._safe(self.run_relabel_round),
                 "interval", hours=max(1, self.trace_interval_hours // 4),
                 id="relabel_round", next_run_time=_now_plus(900),
+                max_instances=1, coalesce=True,
             )
         else:
             logger.info("traceroute disabled: skipping trace_round/relabel_round")
@@ -105,11 +110,13 @@ class MasterScheduler:
             self._safe(self.run_export_round),
             "interval", minutes=30,
             id="export_round", next_run_time=_now_plus(300),
+            max_instances=1, coalesce=True,
         )
         self._sched.add_job(
             self._safe(self.run_housekeeping),
             "interval", minutes=5,
             id="housekeeping",
+            max_instances=1, coalesce=True,
         )
         self._sched.start()
         logger.info(
@@ -177,17 +184,18 @@ class MasterScheduler:
                         isp, len(segs), round_id)
             self.strategy.expand_alive_segments(segs, round_id)
             # 同时把刚才采样阶段 TCP ok 的 IP 加 http_trace
-            trace_targets = self._collect_sample_ok_ips(isp, [c for _, c in segs])
+            trace_targets = self._collect_sample_ok_ips(isp, [c for _, c in segs], round_id)
             if trace_targets:
                 self.strategy.queue_http_trace(
                     [(isp, ip) for ip in trace_targets], round_id,
                 )
 
-    def _collect_sample_ok_ips(self, isp: str, cidrs: List[str]) -> List[str]:
+    def _collect_sample_ok_ips(
+        self, isp: str, cidrs: List[str], scan_round_id: str,
+    ) -> List[str]:
         """从 probe_raw 里取出这些 cidr 内, 当前轮采样阶段 TCP ok 的 IP。"""
-        if not cidrs:
+        if not cidrs or not scan_round_id:
             return []
-        # 一次扫描表太重, 这里走 LIKE prefix 匹配 (cidr 是 a.b.c.0/24, prefix = a.b.c.)
         ips: List[str] = []
         with self.storage._conn() as c:
             for cidr in cidrs:
@@ -195,8 +203,9 @@ class MasterScheduler:
                 cur = c.execute(
                     """SELECT DISTINCT ip FROM probe_raw
                        WHERE isp=? AND kind='tcp_ping' AND ok=1
-                         AND stage='sample' AND ip LIKE ?""",
-                    (isp, f"{prefix}%"),
+                         AND stage='sample' AND scan_round_id=?
+                         AND ip LIKE ?""",
+                    (isp, scan_round_id, f"{prefix}%"),
                 )
                 ips.extend(r["ip"] for r in cur.fetchall())
         return ips
@@ -206,6 +215,7 @@ class MasterScheduler:
         round_id = self.storage.current_round() or "ad-hoc"
         for isp in self.isps:
             cands = self.scorer.latency_top_candidates(isp, self.speed_top_percentile)
+            cands = self.storage.filter_ips_without_active_speed_tasks(isp, cands)
             if not cands:
                 logger.info("speed_round isp=%s no candidates", isp)
                 continue

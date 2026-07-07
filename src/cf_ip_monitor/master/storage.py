@@ -482,6 +482,43 @@ class Storage:
             c.commit()
         return len(rows)
 
+    def release_assigned_tasks(self, task_ids: List[str]) -> int:
+        """将 assigned 任务退回 pending (pull 解析失败时使用)。"""
+        if not task_ids:
+            return 0
+        with self._conn() as c:
+            qmarks = ",".join("?" * len(task_ids))
+            cur = c.execute(
+                f"""UPDATE task_queue SET state='pending', assigned_at=NULL
+                    WHERE task_id IN ({qmarks}) AND state='assigned'""",
+                task_ids,
+            )
+            c.commit()
+            return cur.rowcount
+
+    def filter_ips_without_active_speed_tasks(
+        self, isp: str, ips: List[str],
+    ) -> List[str]:
+        """过滤掉已有 pending/assigned speed 任务的 IP, 避免重复测速。"""
+        if not ips:
+            return []
+        with self._conn() as c:
+            # SQLite 变量数限制, 分批查
+            busy: set = set()
+            chunk = 400
+            for i in range(0, len(ips), chunk):
+                part = ips[i:i + chunk]
+                qmarks = ",".join("?" * len(part))
+                cur = c.execute(
+                    f"""SELECT DISTINCT ip FROM task_queue
+                       WHERE isp=? AND kind='speed'
+                         AND state IN ('pending', 'assigned')
+                         AND ip IN ({qmarks})""",
+                    [isp, *part],
+                )
+                busy.update(r["ip"] for r in cur.fetchall())
+        return [ip for ip in ips if ip not in busy]
+
     def claim_pending(self, isp: str, limit: int) -> List[sqlite3.Row]:
         """取一批 pending 任务并置为 assigned。
         优先级: stage 越靠前越先取 (sample > expand > http_trace > speed > traceroute)。
@@ -642,6 +679,37 @@ class Storage:
             return cur.fetchone()["n"]
 
     # ------------------------------------------------------------------ event-driven expand
+    def sample_task_progress(
+        self, isp: str, cidr: str, scan_round_id: str,
+    ) -> Tuple[int, int]:
+        """返回 (done, total) 采样阶段任务完成进度。"""
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT
+                      SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) AS done_n,
+                      COUNT(*) AS total
+                   FROM task_queue
+                   WHERE isp=? AND stage='sample' AND scan_round_id=?
+                     AND payload_json LIKE ?""",
+                (isp, scan_round_id, f'%"cidr": "{cidr}"%'),
+            ).fetchone()
+            return (row["done_n"] or 0, row["total"] or 0)
+
+    def sample_cidr_probe_summary(
+        self, isp: str, cidr: str, scan_round_id: str,
+    ) -> Tuple[int, int]:
+        """返回 (ok_count, total_count) 本轮该 /24 采样探测结果汇总。"""
+        prefix = cidr.split("/", 1)[0].rsplit(".", 1)[0] + "."
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT SUM(ok) AS ok_n, COUNT(*) AS total
+                   FROM probe_raw
+                   WHERE isp=? AND kind='tcp_ping' AND stage='sample'
+                     AND scan_round_id=? AND ip LIKE ?""",
+                (isp, scan_round_id, f"{prefix}%"),
+            ).fetchone()
+            return (row["ok_n"] or 0, row["total"] or 0)
+
     def claim_unexpanded_alive_segments(
         self, scan_round_id: str, limit: int = 5000,
     ) -> List[Tuple[str, str]]:
@@ -691,8 +759,14 @@ class Storage:
         with self._conn() as c:
             cur = c.execute(
                 f"""SELECT ip,
-                           AVG(CASE WHEN kind='tcp_ping' AND ok=1
-                                    THEN COALESCE(latency_p50, latency_ms) END) AS lat_p50,
+                           COALESCE(
+                             (SELECT AVG(latency_ms) FROM probe_raw h
+                                WHERE h.ip=probe_raw.ip AND h.isp=probe_raw.isp
+                                  AND h.kind='http_trace' AND h.ok=1
+                                  AND h.measured_at>=?),
+                             AVG(CASE WHEN kind='tcp_ping' AND ok=1
+                                      THEN COALESCE(latency_p50, latency_ms) END)
+                           ) AS lat_p50,
                            AVG(CASE WHEN kind='tcp_ping' AND ok=1
                                     THEN latency_p95 END)                      AS lat_p95,
                            AVG(CASE WHEN kind='tcp_ping' AND ok=1
@@ -725,7 +799,7 @@ class Storage:
                     WHERE isp=? AND measured_at>=?
                       AND (hour_bucket % 24) IN ({hour_filter})
                     GROUP BY ip""",
-                (isp, floor),
+                (isp, floor, floor),
             )
             out: List[SegmentAggregate] = []
             for r in cur.fetchall():
@@ -846,11 +920,12 @@ class Storage:
     def recent_probe_raw(
         self,
         limit: int = 100,
+        offset: int = 0,
         isp: Optional[str] = None,
         kind: Optional[str] = None,
         ip_filter: Optional[str] = None,
-    ) -> List[dict]:
-        """取最近 N 条探测明细, 用于 Web UI 展示。"""
+    ) -> Tuple[List[dict], int]:
+        """取最近 N 条探测明细, 用于 Web UI 展示。返回 (rows, total_matching)。"""
         conditions: List[str] = []
         params: list = []
         if isp:
@@ -863,15 +938,19 @@ class Storage:
             conditions.append("ip LIKE ?")
             params.append(f"%{ip_filter}%")
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        params.append(limit)
         with self._conn() as c:
-            cur = c.execute(
-                f"SELECT ip, isp, node_name, kind, ok, latency_p50, jitter_ms, "
-                f"speed_mbps, colo, dst_country, dst_region, stage, measured_at, error "
-                f"FROM probe_raw {where} ORDER BY measured_at DESC LIMIT ?",
+            total = c.execute(
+                f"SELECT COUNT(*) AS n FROM probe_raw {where}",
                 params,
+            ).fetchone()["n"]
+            cur = c.execute(
+                f"SELECT ip, isp, node_name, kind, ok, latency_ms, latency_p50, "
+                f"latency_p95, jitter_ms, speed_mbps, colo, dst_country, dst_region, "
+                f"stage, measured_at, error "
+                f"FROM probe_raw {where} ORDER BY measured_at DESC LIMIT ? OFFSET ?",
+                [*params, limit, offset],
             )
-            return [dict(r) for r in cur.fetchall()]
+            return [dict(r) for r in cur.fetchall()], total
 
     def probe_stats_summary(
         self,
@@ -891,7 +970,11 @@ class Storage:
                 f"""SELECT isp, kind,
                            COUNT(*) AS total,
                            SUM(ok)  AS ok_n,
-                           AVG(CASE WHEN ok=1 THEN latency_p50 END) AS avg_lat,
+                           AVG(CASE WHEN ok=1
+                                    THEN COALESCE(
+                                      CASE WHEN kind='http_trace' THEN latency_ms END,
+                                      latency_p50, latency_ms
+                                    ) END) AS avg_lat,
                            AVG(CASE WHEN ok=1 AND kind='speed' THEN speed_mbps END) AS avg_spd
                     FROM probe_raw WHERE measured_at>=?{isp_filter}
                     GROUP BY isp, kind""",

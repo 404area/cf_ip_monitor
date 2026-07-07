@@ -27,6 +27,7 @@ body{background:#f0f2f5;font-size:.92rem}
 .stat-card .stat-val{font-size:1.6rem;font-weight:700;line-height:1}
 .stat-card .stat-label{color:#6c757d;font-size:.8rem;margin-top:.25rem}
 #toast-container{position:fixed;bottom:1rem;right:1rem;z-index:9999}
+#ipdataAlert code{font-size:.8rem}
 </style>
 </head>
 <body>
@@ -59,6 +60,8 @@ body{background:#f0f2f5;font-size:.92rem}
     <button class="btn btn-sm btn-outline-light" onclick="clearToken()">退出</button>
   </div>
 </nav>
+
+<div id="ipdataAlert" class="container-fluid mt-2" style="display:none"></div>
 
 <!-- Tabs -->
 <div class="container-fluid mt-3 pb-4">
@@ -156,7 +159,13 @@ body{background:#f0f2f5;font-size:.92rem}
             </select>
             <input type="text" class="form-control form-control-sm" style="max-width:180px"
                    id="fIp" placeholder="IP 地址过滤">
-            <button class="btn btn-sm btn-primary" onclick="loadProbes()">查询</button>
+            <select class="form-select form-select-sm" style="max-width:100px" id="fLimit" onchange="probeOffset=0;loadProbes()">
+              <option value="200">200 条</option>
+              <option value="500" selected>500 条</option>
+              <option value="1000">1000 条</option>
+            </select>
+            <button class="btn btn-sm btn-primary" onclick="probeOffset=0;loadProbes()">查询</button>
+            <button class="btn btn-sm btn-outline-secondary" id="probeMoreBtn" style="display:none" onclick="loadMoreProbes()">加载更多</button>
             <span class="text-muted small ms-auto" id="probeCount"></span>
           </div>
         </div>
@@ -168,7 +177,7 @@ body{background:#f0f2f5;font-size:.92rem}
               <thead class="table-dark">
                 <tr>
                   <th>时间</th><th>IP</th><th>运营商</th><th>节点</th>
-                  <th>类型</th><th>结果</th><th>延迟 p50</th><th>Jitter</th>
+                  <th>类型</th><th>结果</th><th>延迟</th><th>Jitter</th>
                   <th>速度</th><th>Colo</th><th>阶段</th>
                 </tr>
               </thead>
@@ -229,6 +238,12 @@ function fmtTime(ms) {
   return new Date(ms).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 function fmtMs(v)   { return v == null ? '-' : v.toFixed(1) + 'ms'; }
+function probeLat(r) {
+  const v = r.latency_p50 ?? r.latency_ms;
+  if (v == null) return '-';
+  const tag = r.kind === 'tcp_ping' ? 'TCP' : r.kind === 'http_trace' ? 'HTTP' : '';
+  return fmtMs(v) + (tag ? ` <span class="text-muted" style="font-size:.7rem">${tag}</span>` : '');
+}
 function fmtMbps(v) { return v == null ? '-' : v.toFixed(1) + ' MB/s'; }
 function fmtDur(a, b) {
   if (!a || !b) return '-';
@@ -275,6 +290,24 @@ function renderOverview(ov, st) {
   const pending = ov.pending_by_isp || {};
   const prog = ov.round_progress;
   let html = '';
+
+  // ---- IP 库缺失告警 ----
+  const missing = ov.ipdata_missing || [];
+  const alertEl = document.getElementById('ipdataAlert');
+  if (missing.length) {
+    const names = { asn: 'GeoLite2-ASN', city: 'GeoLite2-City', country: 'GeoLite2-Country',
+                    dbip: 'dbip-city-ipv4', ip2region: 'ip2region', qqwry: 'qqwry' };
+    const list = missing.map(k => names[k] || k).join(', ');
+    alertEl.style.display = 'block';
+    alertEl.innerHTML = `<div class="alert alert-warning py-2 mb-0 shadow-sm">
+      <strong>⚠ IP 离线库未就绪</strong> — 缺失: ${list}。
+      地区/线路/路由富化将不可用。请运行 <code>./scripts/download_ipdata.sh</code> 下载
+      (MaxMind 需手动注册后下载 GeoLite2 系列)。
+    </div>`;
+  } else {
+    alertEl.style.display = 'none';
+    alertEl.innerHTML = '';
+  }
 
   // ---- 统计卡片行 ----
   const totalPending = Object.values(pending).reduce((a, b) => a + b, 0);
@@ -467,8 +500,11 @@ async function loadSegments() {
       document.getElementById('segmentsContent').innerHTML = '<div class="col-12 text-center text-muted py-5">暂无数据，等待首次扫描...</div>';
       return;
     }
-    let html = '';
-    Object.entries(segs).sort().forEach(([isp, s]) => {
+    let html = `<div class="col-12"><div class="alert alert-info py-2 small mb-0">
+      C 段状态按 <strong>/24 网段</strong> 统计 (采样 .1/.65/.129/.193 四个点),
+      与单个 IP 的 ping/TCP 结果可能不一致。探测成功指 <strong>TCP 443 可连通</strong>, 不代表 ICMP ping 通。
+    </div></div>`;
+    Object.entries(segs).forEach(([isp, s]) => {
       const total = s.total || 1;
       const alive = s.alive || 0, silent = s.silent || 0, expired = s.expired || 0;
       const unknown = Math.max(0, total - alive - silent - expired);
@@ -502,19 +538,34 @@ async function loadSegments() {
 }
 
 // ===================== Tab 5: 探测明细 =====================
-async function loadProbes() {
-  document.getElementById('probesBody').innerHTML = emptyRow(11, '加载中...');
+let probeOffset = 0;
+let probeRows = [];
+
+async function loadProbes(append = false) {
+  if (!append) {
+    probeOffset = 0;
+    probeRows = [];
+    document.getElementById('probesBody').innerHTML = emptyRow(11, '加载中...');
+  }
   const isp  = document.getElementById('fIsp').value;
   const kind = document.getElementById('fKind').value;
   const ip   = document.getElementById('fIp').value.trim();
+  const limit = parseInt(document.getElementById('fLimit').value, 10) || 500;
   try {
-    const d = await api('/api/ui/probe_recent', { limit: 200, isp, kind, ip: ip || undefined });
+    const d = await api('/api/ui/probe_recent', { limit, offset: probeOffset, isp, kind, ip: ip || undefined });
     const rows = d.probes || [];
-    document.getElementById('probeCount').textContent = `共 ${rows.length} 条`;
-    if (!rows.length) { document.getElementById('probesBody').innerHTML = emptyRow(11); return; }
+    const total = d.total ?? rows.length;
+    probeRows = append ? probeRows.concat(rows) : rows;
+    probeOffset += rows.length;
+    const moreBtn = document.getElementById('probeMoreBtn');
+    moreBtn.style.display = probeOffset < total ? 'inline-block' : 'none';
+    document.getElementById('probeCount').textContent =
+      `显示 ${probeRows.length.toLocaleString()} / 共 ${total.toLocaleString()} 条`;
+    if (!probeRows.length) { document.getElementById('probesBody').innerHTML = emptyRow(11); return; }
     let html = '';
-    rows.forEach(r => {
+    probeRows.forEach(r => {
       const okBadge = r.ok ? '<span class="badge badge-ok">OK</span>' : '<span class="badge badge-fail">FAIL</span>';
+      const lat = r.latency_p50 ?? r.latency_ms;
       html += `<tr>
         <td class="small text-muted text-nowrap">${fmtTime(r.measured_at)}</td>
         <td class="font-monospace small">${r.ip}</td>
@@ -522,8 +573,8 @@ async function loadProbes() {
         <td class="small text-muted">${r.node_name || '-'}</td>
         <td>${stageTag(r.kind)}</td>
         <td>${okBadge}</td>
-        <td class="${latClass(r.latency_p50)}">${fmtMs(r.latency_p50)}</td>
-        <td class="small text-muted">${fmtMs(r.jitter_ms)}</td>
+        <td class="${latClass(lat)}">${probeLat(r)}</td>
+        <td class="small text-muted">${r.kind === 'tcp_ping' ? fmtMs(r.jitter_ms) : '-'}</td>
         <td>${fmtMbps(r.speed_mbps)}</td>
         <td>${r.colo ? `<span class="badge bg-info text-dark">${r.colo}</span>` : '-'}</td>
         <td>${stageTag(r.stage)}</td>
@@ -532,6 +583,8 @@ async function loadProbes() {
     document.getElementById('probesBody').innerHTML = html;
   } catch (e) { document.getElementById('probesBody').innerHTML = errRow(11, e.message); }
 }
+
+function loadMoreProbes() { loadProbes(true); }
 
 // ===================== Init =====================
 window.addEventListener('load', () => {

@@ -41,7 +41,7 @@ services:
       # 运行时通过环境变量 CF_IPDATA_DIR=/app/ipdata 指向该目录 (Dockerfile 已默认设置)
       - ./src/cf_ip_monitor/ipdata:/app/ipdata:ro
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/docs', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/healthz', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3

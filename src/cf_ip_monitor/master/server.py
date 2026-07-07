@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Tuple
 
 import yaml
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 from ..ipdata import available as _ipdata_avail
@@ -423,6 +424,73 @@ def build_app(config_path: str) -> FastAPI:
 
     @app.get("/v1/round/list")
     def round_list(limit: int = 10, _=Depends(_check_token)):
+        return {"rounds": storage.list_rounds(limit=limit)}
+
+    # ---------------------------------------------------------------- Web UI
+    _dashboard_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+
+    @app.get("/", include_in_schema=False)
+    def root_redirect():
+        return RedirectResponse(url="/ui")
+
+    @app.get("/ui", response_class=HTMLResponse, include_in_schema=False)
+    def ui_dashboard():
+        """Web 监控面板页面。"""
+        with open(_dashboard_path, encoding="utf-8") as _f:
+            return _f.read()
+
+    @app.get("/api/ui/overview")
+    def ui_overview(_=Depends(_check_token)):
+        """Web UI 概览数据: 当前轮次、任务队列、ISP 列表。"""
+        rid = storage.current_round()
+        prog = storage.round_progress(rid) if rid else None
+        return {
+            "current_round": rid,
+            "round_progress": prog.__dict__ if prog else None,
+            "pending_by_isp": storage.pending_count_by_isp(),
+            "isps": isps,
+        }
+
+    @app.get("/api/ui/best_ips")
+    def ui_best_ips(
+        isp: Optional[str] = None,
+        limit: int = 300,
+        _=Depends(_check_token),
+    ):
+        """Web UI 优选IP: 最新快照中的 best_ip_snapshot 数据。"""
+        rows = storage.latest_best_snapshot(isp=isp, limit=limit)
+        return {"best_ips": rows}
+
+    @app.get("/api/ui/segments")
+    def ui_segments(_=Depends(_check_token)):
+        """Web UI C段状态: 各 ISP alive/silent 数量汇总。"""
+        return {"segments": storage.segment_summary()}
+
+    @app.get("/api/ui/probe_recent")
+    def ui_probe_recent(
+        limit: int = 200,
+        isp: Optional[str] = None,
+        kind: Optional[str] = None,
+        ip: Optional[str] = None,
+        _=Depends(_check_token),
+    ):
+        """Web UI 探测明细: 最近 N 条探测记录。"""
+        rows = storage.recent_probe_raw(
+            limit=min(limit, 500),
+            isp=isp or None,
+            kind=kind or None,
+            ip_filter=ip or None,
+        )
+        return {"probes": rows}
+
+    @app.get("/api/ui/probe_stats")
+    def ui_probe_stats(hours: int = 24, _=Depends(_check_token)):
+        """Web UI 探测统计: 近 N 小时各 ISP 成功率/延迟/速度汇总。"""
+        return {"stats": storage.probe_stats_summary(hours=hours, isps=isps)}
+
+    @app.get("/api/ui/rounds")
+    def ui_rounds_list(limit: int = 20, _=Depends(_check_token)):
+        """Web UI 轮次历史: 近 N 轮扫描记录。"""
         return {"rounds": storage.list_rounds(limit=limit)}
 
     return app

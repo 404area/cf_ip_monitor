@@ -795,6 +795,119 @@ class Storage:
             c.commit()
 
 
+    def latest_best_snapshot(
+        self,
+        isp: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[dict]:
+        """取最新一批 best_ip_snapshot (含路由标签), 用于 Web UI 展示。"""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT MAX(snapshot_at) AS t FROM best_ip_snapshot"
+                + (" WHERE isp=?" if isp else ""),
+                (isp,) if isp else (),
+            ).fetchone()
+            if not row or row["t"] is None:
+                return []
+            latest_ts = row["t"]
+            window_ms = 30 * 60 * 1000
+            query = (
+                "SELECT s.snapshot_at, s.isp, s.region, s.ip, "
+                "       s.latency_p50, s.speed_p50, s.score, "
+                "       l.line_type, l.exit_city, l.quality "
+                "FROM best_ip_snapshot s "
+                "LEFT JOIN ip_route_label l ON s.ip=l.ip AND s.isp=l.isp "
+                "WHERE s.snapshot_at >= ?"
+                + (" AND s.isp=?" if isp else "")
+                + " ORDER BY s.score DESC LIMIT ?"
+            )
+            params: list = [latest_ts - window_ms]
+            if isp:
+                params.append(isp)
+            params.append(limit)
+            cur = c.execute(query, params)
+            return [dict(r) for r in cur.fetchall()]
+
+    def segment_summary(self) -> dict:
+        """统计各 ISP 各 state 的 /24 段数量, 用于 Web UI 展示。"""
+        now = int(time.time() * 1000)
+        with self._conn() as c:
+            cur = c.execute(
+                """SELECT isp,
+                          SUM(CASE WHEN state='alive' THEN 1 ELSE 0 END)                         AS alive,
+                          SUM(CASE WHEN state='silent' AND expires_at >  ? THEN 1 ELSE 0 END)    AS silent,
+                          SUM(CASE WHEN state='silent' AND expires_at <= ? THEN 1 ELSE 0 END)    AS expired,
+                          COUNT(*) AS total
+                   FROM c_segment_state GROUP BY isp""",
+                (now, now),
+            )
+            return {r["isp"]: dict(r) for r in cur.fetchall()}
+
+    def recent_probe_raw(
+        self,
+        limit: int = 100,
+        isp: Optional[str] = None,
+        kind: Optional[str] = None,
+        ip_filter: Optional[str] = None,
+    ) -> List[dict]:
+        """取最近 N 条探测明细, 用于 Web UI 展示。"""
+        conditions: List[str] = []
+        params: list = []
+        if isp:
+            conditions.append("isp=?")
+            params.append(isp)
+        if kind:
+            conditions.append("kind=?")
+            params.append(kind)
+        if ip_filter:
+            conditions.append("ip LIKE ?")
+            params.append(f"%{ip_filter}%")
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        params.append(limit)
+        with self._conn() as c:
+            cur = c.execute(
+                f"SELECT ip, isp, node_name, kind, ok, latency_p50, jitter_ms, "
+                f"speed_mbps, colo, dst_country, dst_region, stage, measured_at, error "
+                f"FROM probe_raw {where} ORDER BY measured_at DESC LIMIT ?",
+                params,
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def probe_stats_summary(
+        self,
+        hours: int = 24,
+        isps: Optional[List[str]] = None,
+    ) -> dict:
+        """近 N 小时各 ISP × kind 探测汇总统计, 用于 Web UI 展示。"""
+        cutoff = int(time.time() * 1000) - hours * 3600 * 1000
+        params: list = [cutoff]
+        isp_filter = ""
+        if isps:
+            qmarks = ",".join("?" * len(isps))
+            isp_filter = f" AND isp IN ({qmarks})"
+            params.extend(isps)
+        with self._conn() as c:
+            cur = c.execute(
+                f"""SELECT isp, kind,
+                           COUNT(*) AS total,
+                           SUM(ok)  AS ok_n,
+                           AVG(CASE WHEN ok=1 THEN latency_p50 END) AS avg_lat,
+                           AVG(CASE WHEN ok=1 AND kind='speed' THEN speed_mbps END) AS avg_spd
+                    FROM probe_raw WHERE measured_at>=?{isp_filter}
+                    GROUP BY isp, kind""",
+                params,
+            )
+            out: dict = {}
+            for r in cur.fetchall():
+                out.setdefault(r["isp"], {})[r["kind"]] = {
+                    "total": r["total"],
+                    "ok": r["ok_n"] or 0,
+                    "avg_lat_ms": round(r["avg_lat"], 1) if r["avg_lat"] else None,
+                    "avg_speed_mbps": round(r["avg_spd"], 1) if r["avg_spd"] else None,
+                }
+            return out
+
+
 def _hour_bucket(ts_ms: int) -> int:
     """把 unix ms 转为按小时归桶, 便于做时段聚合。"""
     return ts_ms // 3600000

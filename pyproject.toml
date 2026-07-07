@@ -29,6 +29,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cf_ip_monitor"]
+include = [
+    "src/cf_ip_monitor/master/dashboard.html",
+]
 exclude = [
     "src/cf_ip_monitor/ipdata/*.mmdb",
     "src/cf_ip_monitor/ipdata/*.xdb",

@@ -748,8 +748,9 @@ class Storage:
     ) -> List[SegmentAggregate]:
         """聚合近期数据 (按当前小时±N 同时段加权样本)。
 
-        - latency_p50 用 probe_raw.latency_p50 字段(新数据)的平均, 老数据回退到 latency_ms
-        - jitter 取 jitter_ms 平均
+        - 候选 IP 必须至少有一次成功的 http_trace, 才视为"真实可用"
+        - latency_p50 优先取 http_trace RTT 的平均, 无则回退 tcp_ping
+        - jitter 仍取 tcp_ping 的 jitter_ms 平均, 只作为辅因子
         """
         now = int(time.time() * 1000)
         floor = now - lookback_ms
@@ -777,6 +778,7 @@ class Storage:
                            COUNT(*)                                             AS total,
                            (SELECT colo FROM probe_raw r2
                               WHERE r2.ip=probe_raw.ip AND r2.isp=probe_raw.isp
+                                AND r2.kind='http_trace' AND r2.ok=1
                                 AND r2.colo IS NOT NULL
                               ORDER BY r2.measured_at DESC LIMIT 1)             AS last_colo,
                            (SELECT dst_asn FROM probe_raw r3
@@ -797,9 +799,15 @@ class Storage:
                               ORDER BY r6.measured_at DESC LIMIT 1)             AS dst_city
                     FROM probe_raw
                     WHERE isp=? AND measured_at>=?
+                      AND EXISTS (
+                            SELECT 1 FROM probe_raw h0
+                            WHERE h0.ip=probe_raw.ip AND h0.isp=probe_raw.isp
+                              AND h0.kind='http_trace' AND h0.ok=1
+                              AND h0.measured_at>=?
+                      )
                       AND (hour_bucket % 24) IN ({hour_filter})
                     GROUP BY ip""",
-                (isp, floor, floor),
+                (floor, isp, floor, floor),
             )
             out: List[SegmentAggregate] = []
             for r in cur.fetchall():

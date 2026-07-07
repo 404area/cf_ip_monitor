@@ -244,6 +244,19 @@ function probeLat(r) {
   const tag = r.kind === 'tcp_ping' ? 'TCP' : r.kind === 'http_trace' ? 'HTTP' : '';
   return fmtMs(v) + (tag ? ` <span class="text-muted" style="font-size:.7rem">${tag}</span>` : '');
 }
+function resultBadge(r) {
+  if (r.kind === 'tcp_ping') {
+    return r.ok
+      ? '<span class="badge bg-secondary">TCP可连</span>'
+      : '<span class="badge badge-fail">TCP失败</span>';
+  }
+  if (r.kind === 'http_trace') {
+    return r.ok
+      ? '<span class="badge badge-ok">HTTP可用</span>'
+      : '<span class="badge badge-fail">HTTP失败</span>';
+  }
+  return r.ok ? '<span class="badge badge-ok">OK</span>' : '<span class="badge badge-fail">FAIL</span>';
+}
 function fmtMbps(v) { return v == null ? '-' : v.toFixed(1) + ' MB/s'; }
 function fmtDur(a, b) {
   if (!a || !b) return '-';
@@ -501,8 +514,8 @@ async function loadSegments() {
       return;
     }
     let html = `<div class="col-12"><div class="alert alert-info py-2 small mb-0">
-      C 段状态按 <strong>/24 网段</strong> 统计 (采样 .1/.65/.129/.193 四个点),
-      与单个 IP 的 ping/TCP 结果可能不一致。探测成功指 <strong>TCP 443 可连通</strong>, 不代表 ICMP ping 通。
+      C 段状态目前仍按 <strong>TCP 443 预筛</strong> 统计 (采样 .1/.65/.129/.193 四个点)，
+      这里只表示“可建立 TCP 连接”，不代表真实 HTTP 可用，更不等于 ICMP ping 通。
     </div></div>`;
     Object.entries(segs).forEach(([isp, s]) => {
       const total = s.total || 1;
@@ -564,7 +577,7 @@ async function loadProbes(append = false) {
     if (!probeRows.length) { document.getElementById('probesBody').innerHTML = emptyRow(11); return; }
     let html = '';
     probeRows.forEach(r => {
-      const okBadge = r.ok ? '<span class="badge badge-ok">OK</span>' : '<span class="badge badge-fail">FAIL</span>';
+      const okBadge = resultBadge(r);
       const lat = r.latency_p50 ?? r.latency_ms;
       html += `<tr>
         <td class="small text-muted text-nowrap">${fmtTime(r.measured_at)}</td>
